@@ -25,15 +25,16 @@ Output files may be aggregated including information for all samples or provided
 | Per-sample SQANTI3 summary | samples/{{ alias }}/sqanti/classification_summary.tsv | SQANTI3 classification summary for the per-sample transcriptome. | per-sample |
 | Differential gene expression results | de_analysis/{{ contrast }}/results_dge.tsv | DESeq2 gene-level differential expression results for one contrast. | aggregated |
 | Differential gene expression plots | de_analysis/{{ contrast }}/results_dge.pdf | PDF plots generated during DESeq2 analysis for one contrast. | aggregated |
+| DGE gene expression prefilter audit | de_analysis/{{ contrast }}/gene_expression_filter.tsv | Written when --de_min_count and --de_min_samples are set. One row per gene in the contrast with the number of samples (overall, target and reference) whose rounded count met --de_min_count, and whether the gene was retained for DESeq2 or excluded. | aggregated |
 | Differential transcript usage results | de_analysis/{{ contrast }}/results_dtu_transcript.tsv | Transcript-level DTU results for one contrast. | aggregated |
 | Differential transcript usage gene summary | de_analysis/{{ contrast }}/results_dtu_gene.tsv | Gene-level DTU summary for one contrast. | aggregated |
 | DEXSeq results | de_analysis/{{ contrast }}/results_dexseq.tsv | Full DEXSeq result table for one contrast. | aggregated |
 | Differential transcript usage plots | de_analysis/{{ contrast }}/results_dtu.pdf | PDF plots generated during DEXSeq analysis for one contrast. | aggregated |
-| Differential analysis QC summary | de_analysis/de_qc_stats.json | Structured DE/DTU QC summary. Use analysis_fallbacks for aggregate counts, and each contrast's deseq2_dispersion_fallback, dexseq_dispersion_method, and dexseq_covariates_dropped fields for interpretation. | aggregated |
+| Differential analysis QC summary | de_analysis/de_qc_stats.json | Structured DE/DTU QC summary. Use analysis_fallbacks for aggregate counts, and each contrast's deseq2_dispersion_fallback, dexseq_dispersion_method, and dexseq_covariates_dropped fields for interpretation. gene_expression_filter records the DGE prefilter settings, and each contrast's gene_filter records the genes before filtering, retained and removed. | aggregated |
 | Differential analysis text summary | de_analysis/de_overall_summary.txt | Human-readable DE/DTU run summary across all contrasts. | aggregated |
 | Per-contrast QC summary | de_analysis/{{ contrast }}/contrast_qc_summary.txt | Human-readable per-contrast DE/DTU QC summary including sample counts and key significance totals. | aggregated |
 | DESeq2 fallback diagnostic | de_analysis/DESeq2_dispersion_fallback_{{ contrast }}.txt | Diagnostic details when DESeq2 falls back to gene-wise dispersion estimation. | aggregated |
-| DGE failure diagnostic | de_analysis/{{ contrast }}/DGE_ANALYSIS_FAILED.txt | Diagnostic details when DESeq2 fails for a contrast. | aggregated |
+| DGE failure diagnostic | de_analysis/{{ contrast }}/DGE_ANALYSIS_FAILED.txt | Diagnostic details when DESeq2 fails for a contrast, or when no genes pass the gene expression prefilter. | aggregated |
 | DTU failure diagnostic | de_analysis/{{ contrast }}/DTU_ANALYSIS_FAILED.txt | Diagnostic details when DEXSeq fails for a contrast. | aggregated |
 | Multiple-testing warning | de_analysis/MULTIPLE_TESTING_WARNING.txt | Family-wise error-rate note generated when multiple contrasts are tested. | aggregated |
 | IGV configuration | igv.json | JSON configuration for viewing the aligned BAMs in IGV. | aggregated |

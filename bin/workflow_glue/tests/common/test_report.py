@@ -768,6 +768,194 @@ def test_report_main_tolerates_missing_statistical_fields(monkeypatch, tmp_path)
     assert "parametric" in method_tables[0].to_string()
 
 
+def _capture_de_report(monkeypatch, tmp_path, de_qc):
+    """Render the report with DE QC and capture tables, headings and banners."""
+    captured = {"tables": [], "headings": [], "banners": []}
+
+    monkeypatch.setattr(report.labs, "LabsReport", _FakeReport)
+    monkeypatch.setattr(report, "Tabs", _FakeTabs)
+    monkeypatch.setattr(report, "p", lambda *args, **kwargs: None)
+    monkeypatch.setattr(report, "pre", lambda *args, **kwargs: None)
+    monkeypatch.setattr(report.fastcat, "SeqSummary", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        report,
+        "h4",
+        lambda label: (captured["headings"].append(label), _NullContext())[1],
+    )
+    monkeypatch.setattr(
+        report,
+        "_create_warning_banner",
+        lambda message, level="warning": captured["banners"].append((level, message)),
+    )
+    monkeypatch.setattr(
+        report.DataTable,
+        "from_pandas",
+        staticmethod(
+            lambda table, *args, **kwargs: captured["tables"].append(table.copy())
+        ),
+    )
+
+    args, out_report = _build_report_args(tmp_path, de_qc=de_qc)
+    report.main(args)
+    assert out_report.exists()
+    return captured
+
+
+def _gene_filter_de_qc(enabled):
+    """DE QC JSON as written by supeRglue de_analysis with the DGE prefilter."""
+    min_count, min_samples = (10, 3) if enabled else (0, 0)
+
+    def gene_filter(retained, removed):
+        block = {
+            "enabled": enabled,
+            "min_count": min_count,
+            "min_samples": min_samples,
+            "genes_input": retained + removed,
+            "genes_retained": retained,
+            "genes_removed": removed,
+        }
+        if enabled:
+            block["audit_file"] = "contrast/gene_expression_filter.tsv"
+        return block
+
+    return {
+        "total_samples": 9,
+        "condition_column": "condition",
+        "reference_level": "control",
+        "covariates": "none",
+        "num_contrasts": 2,
+        "sample_size_warnings": "none",
+        "samples_per_group": {"control": 3, "treated": 3, "treated2": 3},
+        "gene_expression_filter": {
+            "enabled": enabled,
+            "min_count": min_count,
+            "min_samples": min_samples,
+        },
+        "contrasts": {
+            "condition_treated_vs_control": {
+                "n_samples": 6,
+                "n_target": 3,
+                "n_reference": 3,
+                "dge_status": "SUCCESS",
+                "genes_tested": 36 if enabled else 43,
+                "dge_significant_fdr05": 9,
+                "dge_upregulated": 5,
+                "dge_downregulated": 4,
+                "dtu_status": "SUCCESS",
+                "dtu_significant_genes": 1,
+                "gene_filter": gene_filter(36, 7) if enabled else gene_filter(43, 0),
+            },
+            "condition_treated2_vs_control": (
+                {
+                    "n_samples": 6,
+                    "n_target": 3,
+                    "n_reference": 3,
+                    "dge_status": "FAILED",
+                    "dge_failure_reason": "no_genes_passed_expression_filter",
+                    "genes_tested": 0,
+                    "dge_significant_fdr05": 0,
+                    "dtu_status": "SUCCESS",
+                    "dtu_significant_genes": 0,
+                    "gene_filter": gene_filter(0, 43),
+                }
+                if enabled
+                else {
+                    "n_samples": 6,
+                    "n_target": 3,
+                    "n_reference": 3,
+                    "dge_status": "SUCCESS",
+                    "genes_tested": 43,
+                    "dge_significant_fdr05": 2,
+                    "dtu_status": "SUCCESS",
+                    "dtu_significant_genes": 0,
+                    "gene_filter": gene_filter(43, 0),
+                }
+            ),
+        },
+    }
+
+
+def test_report_main_renders_gene_expression_prefilter(monkeypatch, tmp_path):
+    """Enabled DGE prefilter settings, counts and failures reach the report."""
+    captured = _capture_de_report(
+        monkeypatch, tmp_path, _gene_filter_de_qc(enabled=True)
+    )
+    tables, banners = captured["tables"], captured["banners"]
+
+    assert "Gene Expression Prefilter (DGE only)" in captured["headings"]
+    design = next(
+        table for table in tables
+        if list(table.columns) == ["Parameter", "Value"]
+    )
+    design_values = dict(zip(design["Parameter"], design["Value"]))
+    assert design_values["Gene expression prefilter (DGE only)"] == (
+        "Rounded count ≥ 10 in ≥ 3 samples of each contrast"
+    )
+
+    filter_table = next(
+        table for table in tables if "Genes retained (tested)" in table.columns
+    ).set_index("Contrast")
+    treated = filter_table.loc["condition_treated_vs_control"]
+    assert treated["Genes before prefilter"] == 43
+    assert treated["Genes retained (tested)"] == 36
+    assert treated["Genes removed"] == 7
+    assert treated["Audit table"] == "contrast/gene_expression_filter.tsv"
+    assert filter_table.loc[
+        "condition_treated2_vs_control", "Genes retained (tested)"
+    ] == 0
+
+    summary = next(
+        table for table in tables if "DGE Genes Tested" in table.columns
+    ).set_index("Contrast")
+    assert summary.loc["condition_treated_vs_control", "DGE Genes Tested"] == 36
+    # A contrast with no genes left is not reported as zero significant DEGs.
+    assert summary.loc["condition_treated2_vs_control", "DGE Genes Tested"] == "N/A"
+    assert summary.loc[
+        "condition_treated2_vs_control", "DGE Significant (FDR<0.05)"
+    ] == "N/A"
+
+    assert any(
+        level == "danger"
+        and "No genes passed the gene expression prefilter" in message
+        and "condition_treated2_vs_control" in message
+        and "condition_treated_vs_control" not in message
+        for level, message in banners
+    )
+    assert any(
+        level == "info" and "36 of 43 genes retained, 7 removed" in message
+        for level, message in banners
+    )
+    warnings_table = next(
+        table for table in tables if "Warning Type" in table.columns
+    )
+    assert "DGE Prefilter Removed All Genes" in set(warnings_table["Warning Type"])
+
+
+def test_report_main_renders_disabled_gene_expression_prefilter(
+    monkeypatch, tmp_path
+):
+    """A disabled DGE prefilter is stated without per-contrast filter output."""
+    captured = _capture_de_report(
+        monkeypatch, tmp_path, _gene_filter_de_qc(enabled=False)
+    )
+    tables, banners = captured["tables"], captured["banners"]
+
+    design = next(
+        table for table in tables
+        if list(table.columns) == ["Parameter", "Value"]
+    )
+    design_values = dict(zip(design["Parameter"], design["Value"]))
+    assert design_values["Gene expression prefilter (DGE only)"] == (
+        "Disabled (all genes passed to DESeq2)"
+    )
+    assert not any("Genes retained (tested)" in table.columns for table in tables)
+    assert not any("gene expression prefilter" in msg.lower() for _, msg in banners)
+    summary = next(
+        table for table in tables if "DGE Genes Tested" in table.columns
+    ).set_index("Contrast")
+    assert summary.loc["condition_treated_vs_control", "DGE Genes Tested"] == 43
+
+
 def test_round_de_table_formats_supported_numeric_columns():
     """DE/DTU preview tables should round known numeric columns for display."""
     table = pd.DataFrame(

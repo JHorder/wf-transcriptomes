@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Optional gene expression prefilter for differential gene expression, enabled with `--de_min_count` and `--de_min_samples` (for example `--de_min_count 10 --de_min_samples 3`). Within each contrast, only genes whose rounded count reaches `--de_min_count` in at least `--de_min_samples` of that contrast's samples are passed to DESeq2, before size factors and dispersions are estimated. Both default to 0, which disables the prefilter and keeps the previous behaviour. DTU is not filtered.
+- Per-contrast `gene_expression_filter.tsv` audit table, prefilter settings and gene counts in `de_qc_stats.json`, the text summaries and the report. A contrast where no gene passes the prefilter is reported as a DGE failure rather than as having no significant genes.
+
+
 ## [v2.0.3]
 This patch release of `wf-transcriptomes` removes a legacy configuration override that limited the memory allocation of the workflow when executed with the AWS Batch profile.
 This version will be deployed into EPI2ME Cloud to address issues with the alignment step. Local users do not need to adopt this release.

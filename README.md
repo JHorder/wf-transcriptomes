@@ -294,6 +294,48 @@ differential transcript usage. These analyses use the shared `bambu` outputs
 and the design columns in the sample sheet, and each comparison is written to
 its own subdirectory under `de_analysis/<contrast>/`.
 
+#### Optional gene expression prefilter for differential gene expression
+
+By default every gene in the cohort gene count matrix is passed to `DESeq2`.
+To remove weakly supported genes before model fitting, set both
+`--de_min_count` and `--de_min_samples`, for example:
+
+```
+--de_analysis --de_min_count 10 --de_min_samples 3
+```
+
+The prefilter is applied separately to each pairwise contrast, using only the
+samples of that contrast's two conditions; samples of any other condition do not
+count. Counts are rounded exactly as they are for `DESeq2`, and a gene is kept
+when at least `--de_min_samples` of those samples, from either condition, have a
+rounded count of at least `--de_min_count`. A gene expressed in all replicates of
+only one condition can therefore be kept, while a gene supported by a single
+sample is removed. The prefilter runs before `DESeq2` estimates size factors and
+dispersions, so those estimates use only the retained genes.
+
+The prefilter is separate from `DESeq2`'s independent filtering, which still
+runs after testing when adjusted p-values are calculated (genes it filters
+have `padj` set to `NA`). Because the prefilter changes which genes are tested
+and the data used for normalisation and dispersion estimation, the number of
+significant genes can change in either direction.
+
+Leaving both parameters at 0 (the default) disables the prefilter. Setting only
+one of them, or setting `--de_min_samples` higher than the number of samples in
+any contrast, is rejected when the workflow starts. The prefilter applies only to
+differential gene expression: DTU, transcript discovery, quantification, the
+cohort count tables, and the report's cohort heatmaps and PCA use all genes and
+transcripts.
+
+When the prefilter is enabled, each contrast directory also contains
+`gene_expression_filter.tsv`, listing every gene with the number of samples that
+met `--de_min_count` (overall, and in the target and reference conditions) and
+whether it was retained or excluded. The settings and the number of genes before
+filtering, retained and removed for each contrast are recorded in
+`de_analysis/de_qc_stats.json`, the text summaries, and the report, and the
+reported number of genes tested is the number retained. If no gene passes for a
+contrast, its DGE status is `FAILED`, `DGE_ANALYSIS_FAILED.txt` explains why, and
+no test is reported for that contrast rather than zero significant genes.
+
 ### 9. What you need to provide
 
 The workflow's analysis is controlled by a user provided genome, annotation, and
@@ -351,6 +393,8 @@ The workflow's analysis is controlled by a user provided genome, annotation, and
 | condition_column | string | Main comparison column in the sample sheet. |  | condition |
 | covariates | string | Comma-separated extra sample-sheet columns to adjust for, for example batch. | Each listed name must exist as a column in the sample sheet. |  |
 | reference_level | string | Baseline group for the main comparison column. | If omitted, the workflow will use control when that level exists. |  |
+| de_min_count | integer | Gene expression prefilter for differential gene expression: minimum rounded count a sample must reach. | Used together with `--de_min_samples`. Leave both at 0 (the default) to disable the prefilter; set both to at least 1 to enable it, for example `--de_min_count 10 --de_min_samples 3`. Within each pairwise contrast, a gene is passed to DESeq2 only if at least `--de_min_samples` of that contrast's samples, from either condition, have a rounded count of at least `--de_min_count`. The prefilter runs before DESeq2 estimates size factors and dispersions, and is separate from DESeq2's independent filtering. It does not affect differential transcript usage, quantification, or cohort outputs. | 0 |
+| de_min_samples | integer | Gene expression prefilter for differential gene expression: minimum number of samples in a contrast reaching `--de_min_count`. | Used together with `--de_min_count`. Leave both at 0 (the default) to disable the prefilter. Must not exceed the number of samples in any contrast (reference plus target condition). | 0 |
 
 
 ### Output Options
@@ -404,15 +448,16 @@ Output files may be aggregated including information for all samples or provided
 | Per-sample SQANTI3 summary | samples/{{ alias }}/sqanti/classification_summary.tsv | SQANTI3 classification summary for the per-sample transcriptome. | per-sample |
 | Differential gene expression results | de_analysis/{{ contrast }}/results_dge.tsv | DESeq2 gene-level differential expression results for one contrast. | aggregated |
 | Differential gene expression plots | de_analysis/{{ contrast }}/results_dge.pdf | PDF plots generated during DESeq2 analysis for one contrast. | aggregated |
+| DGE gene expression prefilter audit | de_analysis/{{ contrast }}/gene_expression_filter.tsv | Written when --de_min_count and --de_min_samples are set. One row per gene in the contrast with the number of samples (overall, target and reference) whose rounded count met --de_min_count, and whether the gene was retained for DESeq2 or excluded. | aggregated |
 | Differential transcript usage results | de_analysis/{{ contrast }}/results_dtu_transcript.tsv | Transcript-level DTU results for one contrast. | aggregated |
 | Differential transcript usage gene summary | de_analysis/{{ contrast }}/results_dtu_gene.tsv | Gene-level DTU summary for one contrast. | aggregated |
 | DEXSeq results | de_analysis/{{ contrast }}/results_dexseq.tsv | Full DEXSeq result table for one contrast. | aggregated |
 | Differential transcript usage plots | de_analysis/{{ contrast }}/results_dtu.pdf | PDF plots generated during DEXSeq analysis for one contrast. | aggregated |
-| Differential analysis QC summary | de_analysis/de_qc_stats.json | Structured DE/DTU QC summary. Use analysis_fallbacks for aggregate counts, and each contrast's deseq2_dispersion_fallback, dexseq_dispersion_method, and dexseq_covariates_dropped fields for interpretation. | aggregated |
+| Differential analysis QC summary | de_analysis/de_qc_stats.json | Structured DE/DTU QC summary. Use analysis_fallbacks for aggregate counts, and each contrast's deseq2_dispersion_fallback, dexseq_dispersion_method, and dexseq_covariates_dropped fields for interpretation. gene_expression_filter records the DGE prefilter settings, and each contrast's gene_filter records the genes before filtering, retained and removed. | aggregated |
 | Differential analysis text summary | de_analysis/de_overall_summary.txt | Human-readable DE/DTU run summary across all contrasts. | aggregated |
 | Per-contrast QC summary | de_analysis/{{ contrast }}/contrast_qc_summary.txt | Human-readable per-contrast DE/DTU QC summary including sample counts and key significance totals. | aggregated |
 | DESeq2 fallback diagnostic | de_analysis/DESeq2_dispersion_fallback_{{ contrast }}.txt | Diagnostic details when DESeq2 falls back to gene-wise dispersion estimation. | aggregated |
-| DGE failure diagnostic | de_analysis/{{ contrast }}/DGE_ANALYSIS_FAILED.txt | Diagnostic details when DESeq2 fails for a contrast. | aggregated |
+| DGE failure diagnostic | de_analysis/{{ contrast }}/DGE_ANALYSIS_FAILED.txt | Diagnostic details when DESeq2 fails for a contrast, or when no genes pass the gene expression prefilter. | aggregated |
 | DTU failure diagnostic | de_analysis/{{ contrast }}/DTU_ANALYSIS_FAILED.txt | Diagnostic details when DEXSeq fails for a contrast. | aggregated |
 | Multiple-testing warning | de_analysis/MULTIPLE_TESTING_WARNING.txt | Family-wise error-rate note generated when multiple contrasts are tested. | aggregated |
 | IGV configuration | igv.json | JSON configuration for viewing the aligned BAMs in IGV. | aggregated |
@@ -441,6 +486,12 @@ Find related RNA and cDNA sequencing protocols in the
   primary condition column, and any columns named in `--covariates`.
 + DE/DTU requires at least two condition levels and at least two samples per
   level.
++ `--de_min_count` and `--de_min_samples` must both be 0 or both be at least 1,
+  and `--de_min_samples` cannot exceed the number of samples in any contrast.
++ If a contrast reports that no genes passed the gene expression prefilter, no
+  DGE test was run for it. Lower `--de_min_count` or `--de_min_samples`, and use
+  `de_analysis/<contrast>/gene_expression_filter.tsv` to see how many samples
+  supported each gene.
 + See how to interpret common Nextflow exit codes
   [here](https://epi2me.nanoporetech.com/epi2me-docs/help/troubleshooting/).
 
@@ -537,6 +588,72 @@ the workflow also emits independent per-sample transcriptomes.
 ### Can I run DE/DTU without transcript discovery?
 
 Yes. Use `--transcriptome_mode fixed_annotation` together with `--de_analysis`.
+
+### How do I remove low-expression genes before differential gene expression?
+
+Set `--de_min_count` and `--de_min_samples` together, for example
+`--de_min_count 10 --de_min_samples 3`. Within each contrast, a gene is passed to
+`DESeq2` only if at least 3 of that contrast's samples have a rounded count of at
+least 10. See the pipeline overview for details. The prefilter is disabled by
+default and does not affect DTU.
+
+### How is the gene expression prefilter different from DESeq2's independent filtering?
+
+The prefilter decides which genes `DESeq2` models at all, and runs before size
+factors and dispersions are estimated. `DESeq2`'s independent filtering is
+unchanged: it runs after testing, uses the mean of normalised counts to choose
+which tested genes receive an adjusted p-value, and sets `padj` to `NA` for the
+rest.
+
+### Can I enable the prefilter on a completed analysis without re-running everything?
+
+Yes. Launch the workflow again from the same launch directory (the one
+containing the `.nextflow/` folder of the original run), with the same work
+directory, inputs, profile and upstream options, add the prefilter options and
+`-resume`, and write to a new output directory:
+
+```
+nextflow run <this workflow> \
+    <original input, reference, sample sheet and DE options> \
+    --de_min_count 10 --de_min_samples 3 \
+    --out_dir output_prefilter_10_3 \
+    -profile <original profile> \
+    -resume
+```
+
+Both options are part of the differential analysis task's command, so changing
+either one makes Nextflow re-run that task and the report, while alignment,
+`bambu`, `SQANTI3` and other upstream tasks are reused from the cache. Cached
+tasks still publish their outputs, so the new output directory receives a full
+set of results, including copies of large files such as BAMs.
+
++ `-resume` continues the most recent run in the launch directory. If other runs
+  have happened since, find the original run name with `nextflow log` and use
+  `-resume <run name>`.
++ Keep the same `-w` work directory if one was set, and do not run
+  `nextflow clean` on it beforehand.
++ Changing the input files, the profile or container settings, or upstream
+  options can invalidate cached tasks.
+
+### Which copy of the differential analysis R code does the workflow run?
+
+The differential analysis task runs `supeRglue de_analysis`. `bin/supeRglue`
+loads the R files in `bin/workflow_glue_r/R/` from the copy of the workflow
+being run; the container only provides R and the R packages (`DESeq2`,
+`DEXSeq`, ...). Nextflow makes the workflow's `bin/` directory available inside
+the container, so running the workflow from a checkout that contains a change is
+enough; no package installation or container rebuild is needed.
+
+Nextflow's task cache does not track these R files. If you change only files
+in `bin/workflow_glue_r/R/` and re-run with `-resume`, the cached differential
+analysis task is reused. To force that task to re-run while reusing the rest,
+pass a config file with `-c` containing:
+
+```
+process {
+    withName: runDifferentialAnalysis { cache = false }
+}
+```
 
 ### What changed from the previous workflow version?
 

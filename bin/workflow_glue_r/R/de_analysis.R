@@ -41,6 +41,30 @@ de_analysis_arg_spec <- function() {
             type = "character"
         ),
         list(
+            name = "de_min_count",
+            flag = "--de_min_count",
+            help = paste(
+                "DGE gene prefilter: minimum rounded count a sample must reach.",
+                "Set both this and --de_min_samples to 0 to disable the filter."
+            ),
+            type = "integer",
+            default = 0L,
+            min = 0,
+            value_error = "--de_min_count must be a non-negative integer."
+        ),
+        list(
+            name = "de_min_samples",
+            flag = "--de_min_samples",
+            help = paste(
+                "DGE gene prefilter: minimum number of contrast samples reaching",
+                "--de_min_count. Set both to 0 to disable the filter."
+            ),
+            type = "integer",
+            default = 0L,
+            min = 0,
+            value_error = "--de_min_samples must be a non-negative integer."
+        ),
+        list(
             name = "out_dir",
             flag = "--out_dir",
             help = "Output directory.",
@@ -501,6 +525,225 @@ de_write_dtu_failure_outputs <- function(
     writeLines(failure_content, file.path(contrast_dir, "DTU_ANALYSIS_FAILED.txt"))
 }
 
+de_write_dge_failure_outputs <- function(
+    contrast_dir,
+    target_level,
+    reference_level,
+    contrast_samples,
+    condition_column,
+    n_genes,
+    message_text,
+    gene_filter_lines = NULL,
+    failure_hint = NULL
+) {
+    failure_content <- c(
+        "DGE Analysis Failed",
+        "===================",
+        "",
+        sprintf("Timestamp: %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
+        sprintf("Contrast: %s vs %s", target_level, reference_level),
+        sprintf(
+            "Samples: %d (%d %s, %d %s)",
+            nrow(contrast_samples),
+            sum(contrast_samples[[condition_column]] == target_level),
+            target_level,
+            sum(contrast_samples[[condition_column]] == reference_level),
+            reference_level
+        ),
+        sprintf("Genes: %d", n_genes),
+        gene_filter_lines,
+        "",
+        "ERROR MESSAGE:",
+        sprintf("  %s", message_text),
+        if (!is.null(failure_hint)) {
+            c(
+                "",
+                "PROBABLE CAUSE:",
+                sprintf("  %s", failure_hint)
+            )
+        } else {
+            NULL
+        },
+        "",
+        "DGE RESULTS CANNOT BE INTERPRETED",
+        ""
+    )
+    writeLines(failure_content, file.path(contrast_dir, "DGE_ANALYSIS_FAILED.txt"))
+}
+
+de_gene_filter_audit_filename <- "gene_expression_filter.tsv"
+
+#' Resolve the differential gene expression (DGE) prefilter settings.
+#'
+#' The prefilter is disabled when both thresholds are 0, which is the default
+#' and reproduces the unfiltered behaviour. Setting only one threshold is
+#' rejected because a lone 0 would make the filter a silent no-op.
+#'
+#' @param min_count Minimum rounded count a sample must reach.
+#' @param min_samples Minimum number of contrast samples reaching `min_count`.
+#'
+#' @return A list with `enabled`, `min_count` and `min_samples`.
+de_gene_filter_settings <- function(min_count = 0L, min_samples = 0L) {
+    as_threshold <- function(value, flag) {
+        if (is.null(value)) {
+            return(0L)
+        }
+        if (
+            length(value) != 1 ||
+                !is.numeric(value) ||
+                is.na(value) ||
+                value < 0 ||
+                value != round(value)
+        ) {
+            stop(sprintf("%s must be a non-negative integer.", flag), call. = FALSE)
+        }
+        as.integer(value)
+    }
+    min_count <- as_threshold(min_count, "--de_min_count")
+    min_samples <- as_threshold(min_samples, "--de_min_samples")
+
+    if (xor(min_count > 0L, min_samples > 0L)) {
+        stop(
+            sprintf(
+                paste(
+                    "--de_min_count (%d) and --de_min_samples (%d) must either both be 0",
+                    "(gene expression prefilter disabled) or both be at least 1",
+                    "(prefilter enabled), for example --de_min_count 10 --de_min_samples 3."
+                ),
+                min_count,
+                min_samples
+            ),
+            call. = FALSE
+        )
+    }
+
+    list(
+        enabled = min_count > 0L,
+        min_count = min_count,
+        min_samples = min_samples
+    )
+}
+
+de_gene_filter_rule <- function(gene_filter, n_samples = NULL) {
+    if (!isTRUE(gene_filter$enabled)) {
+        return("disabled (all genes are passed to DESeq2)")
+    }
+    sprintf(
+        "keep genes with rounded count >= %d in >= %d %s",
+        gene_filter$min_count,
+        gene_filter$min_samples,
+        if (is.null(n_samples)) {
+            "samples of the contrast"
+        } else {
+            sprintf("of the %d contrast samples", n_samples)
+        }
+    )
+}
+
+#' Reject prefilter settings that no gene could satisfy in some contrast.
+#'
+#' @param gene_filter Settings from `de_gene_filter_settings()`.
+#' @param contrast_sizes Named integer vector of samples per contrast.
+de_validate_gene_filter_contrasts <- function(gene_filter, contrast_sizes) {
+    if (!isTRUE(gene_filter$enabled)) {
+        return(invisible(gene_filter))
+    }
+    too_small <- contrast_sizes[contrast_sizes < gene_filter$min_samples]
+    if (length(too_small) > 0) {
+        stop(
+            sprintf(
+                paste(
+                    "--de_min_samples (%d) exceeds the number of samples in %s: %s.",
+                    "No gene could pass the gene expression prefilter; set",
+                    "--de_min_samples to at most %d."
+                ),
+                gene_filter$min_samples,
+                if (length(too_small) == 1) "contrast" else "contrasts",
+                paste(sprintf("%s (%d samples)", names(too_small), too_small), collapse = ", "),
+                min(contrast_sizes)
+            ),
+            call. = FALSE
+        )
+    }
+    invisible(gene_filter)
+}
+
+#' Apply the DGE gene expression prefilter to one contrast's count matrix.
+#'
+#' Counts are rounded exactly as they are for DESeq2, then a gene is kept when
+#' at least `min_samples` of the contrast's samples, from either condition,
+#' have a rounded count of at least `min_count`. Callers must pass only the
+#' contrast's samples so that excluded conditions cannot contribute. When the
+#' filter is disabled the input matrix is returned untouched.
+#'
+#' @param count_mat Gene count matrix restricted to the contrast's samples.
+#' @param gene_filter Settings from `de_gene_filter_settings()`.
+#'
+#' @return A list with the `counts` to model, the per-gene `keep` flags and
+#'   `n_samples_meeting` counts (NULL when disabled), and gene totals.
+de_apply_gene_expression_filter <- function(count_mat, gene_filter) {
+    n_input <- nrow(count_mat)
+    if (!isTRUE(gene_filter$enabled)) {
+        return(list(
+            counts = count_mat,
+            meets_min_count = NULL,
+            keep = NULL,
+            n_input = n_input,
+            n_retained = n_input,
+            n_removed = 0L
+        ))
+    }
+
+    count_mat <- round(count_mat)
+    meets_min_count <- count_mat >= gene_filter$min_count
+    keep <- rowSums(meets_min_count) >= gene_filter$min_samples
+    list(
+        counts = count_mat[keep, , drop = FALSE],
+        meets_min_count = meets_min_count,
+        keep = keep,
+        n_input = n_input,
+        n_retained = sum(keep),
+        n_removed = sum(!keep)
+    )
+}
+
+#' Build the per-gene audit table for an enabled prefilter.
+#'
+#' @return A data frame with one row per input gene, recording how many
+#'   contrast samples (overall, target and reference) met the count threshold
+#'   and whether the gene was retained for DESeq2 or excluded.
+de_gene_filter_audit_table <- function(
+    filter_result,
+    contrast_samples,
+    condition_column,
+    target_level,
+    gene_meta
+) {
+    meets <- filter_result$meets_min_count
+    target_aliases <- contrast_samples$alias[
+        as.character(contrast_samples[[condition_column]]) == target_level
+    ]
+    reference_aliases <- setdiff(contrast_samples$alias, target_aliases)
+    audit <- data.frame(
+        GENEID = rownames(meets),
+        n_samples_meeting_min_count = as.integer(rowSums(meets)),
+        n_target_samples_meeting_min_count = as.integer(
+            rowSums(meets[, target_aliases, drop = FALSE])
+        ),
+        n_reference_samples_meeting_min_count = as.integer(
+            rowSums(meets[, reference_aliases, drop = FALSE])
+        ),
+        filter_status = ifelse(filter_result$keep, "retained", "excluded"),
+        row.names = NULL,
+        stringsAsFactors = FALSE
+    )
+    if ("gene_name" %in% names(gene_meta)) {
+        audit$gene_name <- gene_meta$gene_name[match(audit$GENEID, gene_meta$GENEID)]
+        audit <- audit[, c("GENEID", "gene_name", setdiff(names(audit), c("GENEID", "gene_name")))]
+    }
+    workflow_glue_r_normalise_tsv_df(audit)
+}
+
 de_run_deseq2_result <- function(
     count_mat,
     coldata,
@@ -737,8 +980,14 @@ de_postprocess_dexseq_result <- function(
     )
 }
 
+de_contrast_name <- function(condition_column, target_level, reference_level) {
+    sprintf("%s_%s_vs_%s", condition_column, target_level, reference_level)
+}
+
 main_run_de_analysis <- function(args) {
     set.seed(42)
+    gene_filter <- de_gene_filter_settings(args$de_min_count, args$de_min_samples)
+    message("DGE gene expression prefilter: ", de_gene_filter_rule(gene_filter))
     dir.create(args$out_dir, showWarnings = FALSE, recursive = TRUE)
 
     tx_se <- readRDS(args$transcript_rds)
@@ -771,6 +1020,13 @@ main_run_de_analysis <- function(args) {
         condition_column = args$condition_column,
         reference_level = reference_level,
         covariates = if (length(covariates) > 0) covariates else "none",
+        gene_expression_filter = list(
+            enabled = gene_filter$enabled,
+            min_count = gene_filter$min_count,
+            min_samples = gene_filter$min_samples,
+            applies_to = "differential gene expression (DESeq2) only",
+            rule = de_gene_filter_rule(gene_filter)
+        ),
         num_contrasts = length(targets),
         contrasts = list()
     )
@@ -800,6 +1056,12 @@ main_run_de_analysis <- function(args) {
     } else {
         "none"
     }
+
+    contrast_sizes <- vapply(targets, function(target_level) {
+        sum(sample_df[[args$condition_column]] %in% c(reference_level, target_level))
+    }, integer(1))
+    names(contrast_sizes) <- de_contrast_name(args$condition_column, targets, reference_level)
+    de_validate_gene_filter_contrasts(gene_filter, contrast_sizes)
 
     if (length(targets) > 1) {
         fwer <- (1 - (1 - 0.05)^length(targets)) * 100
@@ -837,12 +1099,7 @@ main_run_de_analysis <- function(args) {
     }
 
     for (target_level in targets) {
-        contrast_name <- sprintf(
-            "%s_%s_vs_%s",
-            args$condition_column,
-            target_level,
-            reference_level
-        )
+        contrast_name <- de_contrast_name(args$condition_column, target_level, reference_level)
         contrast_dir <- file.path(args$out_dir, contrast_name)
         dir.create(contrast_dir, showWarnings = FALSE, recursive = TRUE)
 
@@ -884,56 +1141,133 @@ main_run_de_analysis <- function(args) {
 
         gene_counts <- SummarizedExperiment::assays(gene_se)$counts[, contrast_samples$alias, drop = FALSE]
         tx_counts <- SummarizedExperiment::assays(tx_se)$counts[, contrast_samples$alias, drop = FALSE]
-        contrast_qc$genes_tested <- nrow(gene_counts)
-        contrast_qc$transcripts_tested <- nrow(tx_counts)
 
-        dge_run <- tryCatch(
-            de_run_deseq2_result(
-                gene_counts,
-                contrast_samples,
-                target_level,
-                reference_level,
-                args$condition_column,
-                covariates,
-                args$out_dir,
-                contrast_name
-            ),
-            error = function(err) {
-                warning(
-                    "DESeq2 DGE failed for contrast ",
-                    target_level, " vs ", reference_level,
-                    "\nError: ", conditionMessage(err)
-                )
-                failure_content <- c(
-                    "DGE Analysis Failed",
-                    "===================",
-                    "",
-                    sprintf("Timestamp: %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
-                    sprintf("Contrast: %s vs %s", target_level, reference_level),
-                    sprintf(
-                        "Samples: %d (%d %s, %d %s)",
-                        nrow(contrast_samples),
-                        sum(contrast_samples[[args$condition_column]] == target_level),
-                        target_level,
-                        sum(contrast_samples[[args$condition_column]] == reference_level),
-                        reference_level
-                    ),
-                    sprintf("Genes: %d", nrow(gene_counts)),
-                    "",
-                    "ERROR MESSAGE:",
-                    sprintf("  %s", conditionMessage(err)),
-                    "",
-                    "DGE RESULTS CANNOT BE INTERPRETED",
-                    ""
-                )
-                writeLines(failure_content, file.path(contrast_dir, "DGE_ANALYSIS_FAILED.txt"))
-                NULL
-            }
+        # The prefilter sees only this contrast's samples and runs before the
+        # DESeq2 dataset, size factors and dispersions exist. DTU is unaffected.
+        gene_filter_result <- de_apply_gene_expression_filter(gene_counts, gene_filter)
+        contrast_qc$genes_tested <- gene_filter_result$n_retained
+        contrast_qc$transcripts_tested <- nrow(tx_counts)
+        contrast_qc$gene_filter <- list(
+            enabled = gene_filter$enabled,
+            min_count = gene_filter$min_count,
+            min_samples = gene_filter$min_samples,
+            genes_input = gene_filter_result$n_input,
+            genes_retained = gene_filter_result$n_retained,
+            genes_removed = gene_filter_result$n_removed
         )
+        gene_filter_lines <- NULL
+        if (gene_filter$enabled) {
+            utils::write.table(
+                de_gene_filter_audit_table(
+                    gene_filter_result,
+                    contrast_samples,
+                    args$condition_column,
+                    target_level,
+                    gene_meta
+                ),
+                file = file.path(contrast_dir, de_gene_filter_audit_filename),
+                sep = "\t",
+                quote = FALSE,
+                row.names = FALSE
+            )
+            contrast_qc$gene_filter$audit_file <- file.path(contrast_name, de_gene_filter_audit_filename)
+            gene_filter_lines <- c(
+                sprintf(
+                    "Gene expression prefilter: %s",
+                    de_gene_filter_rule(gene_filter, nrow(contrast_samples))
+                ),
+                sprintf("Genes before prefilter: %d", gene_filter_result$n_input),
+                sprintf("Genes removed by prefilter: %d", gene_filter_result$n_removed)
+            )
+            message(
+                sprintf(
+                    "%s: gene expression prefilter retained %d of %d genes (%d removed).",
+                    contrast_name,
+                    gene_filter_result$n_retained,
+                    gene_filter_result$n_input,
+                    gene_filter_result$n_removed
+                )
+            )
+        }
+
+        dge_failure_reason <- NULL
+        dge_failure_message <- NULL
+        if (gene_filter$enabled && gene_filter_result$n_retained == 0) {
+            dge_failure_reason <- "no_genes_passed_expression_filter"
+            dge_failure_message <- sprintf(
+                paste(
+                    "No genes passed the gene expression prefilter (%s): all %d genes",
+                    "were excluded before DESeq2 fitting, so no differential expression",
+                    "test was performed."
+                ),
+                de_gene_filter_rule(gene_filter, nrow(contrast_samples)),
+                gene_filter_result$n_input
+            )
+            warning(
+                "DESeq2 DGE not run for contrast ",
+                target_level, " vs ", reference_level,
+                "\n", dge_failure_message
+            )
+            de_write_dge_failure_outputs(
+                contrast_dir = contrast_dir,
+                target_level = target_level,
+                reference_level = reference_level,
+                contrast_samples = contrast_samples,
+                condition_column = args$condition_column,
+                n_genes = gene_filter_result$n_retained,
+                message_text = dge_failure_message,
+                gene_filter_lines = gene_filter_lines,
+                failure_hint = paste(
+                    "The prefilter thresholds are too strict for this contrast.",
+                    "Lower --de_min_count and/or --de_min_samples, and check",
+                    "per-gene support in",
+                    paste0(de_gene_filter_audit_filename, ".")
+                )
+            )
+            dge_run <- NULL
+        } else {
+            dge_run <- tryCatch(
+                de_run_deseq2_result(
+                    gene_filter_result$counts,
+                    contrast_samples,
+                    target_level,
+                    reference_level,
+                    args$condition_column,
+                    covariates,
+                    args$out_dir,
+                    contrast_name
+                ),
+                error = function(err) {
+                    warning(
+                        "DESeq2 DGE failed for contrast ",
+                        target_level, " vs ", reference_level,
+                        "\nError: ", conditionMessage(err)
+                    )
+                    de_write_dge_failure_outputs(
+                        contrast_dir = contrast_dir,
+                        target_level = target_level,
+                        reference_level = reference_level,
+                        contrast_samples = contrast_samples,
+                        condition_column = args$condition_column,
+                        n_genes = gene_filter_result$n_retained,
+                        message_text = conditionMessage(err),
+                        gene_filter_lines = gene_filter_lines
+                    )
+                    err
+                }
+            )
+            if (inherits(dge_run, "error")) {
+                dge_failure_reason <- "deseq2_error"
+                dge_failure_message <- conditionMessage(dge_run)
+                dge_run <- NULL
+            }
+        }
 
         if (is.null(dge_run)) {
             dge_res <- workflow_glue_r_empty_tsv(de_dge_columns)
             contrast_qc$dge_status <- "FAILED"
+            contrast_qc$dge_failure_reason <- dge_failure_reason
+            contrast_qc$dge_failure_message <- dge_failure_message
             contrast_qc$dge_total_genes <- 0
             contrast_qc$dge_significant_fdr05 <- 0
             contrast_qc$dge_significant_fdr01 <- 0
@@ -941,7 +1275,11 @@ main_run_de_analysis <- function(args) {
             contrast_qc$dge_downregulated <- 0
             de_write_placeholder_pdf(
                 file.path(contrast_dir, "results_dge.pdf"),
-                "DESeq2 did not converge for this contrast.\nSee DGE_ANALYSIS_FAILED.txt for details."
+                if (identical(dge_failure_reason, "no_genes_passed_expression_filter")) {
+                    "No genes passed the gene expression prefilter for this contrast.\nSee DGE_ANALYSIS_FAILED.txt for details."
+                } else {
+                    "DESeq2 did not converge for this contrast.\nSee DGE_ANALYSIS_FAILED.txt for details."
+                }
             )
         } else {
             if (!is.null(dge_run$deseq2_dispersion_fallback)) {
@@ -1151,6 +1489,20 @@ main_run_de_analysis <- function(args) {
             sprintf("  Reference level (%s): %d samples", reference_level, contrast_qc$n_reference),
             sprintf("  Total samples: %d", contrast_qc$n_samples),
             "",
+            "Gene Expression Prefilter (DGE only):",
+            if (gene_filter$enabled) {
+                c(
+                    "  Status: enabled",
+                    sprintf("  Rule: %s", de_gene_filter_rule(gene_filter, contrast_qc$n_samples)),
+                    sprintf("  Genes before prefilter: %d", contrast_qc$gene_filter$genes_input),
+                    sprintf("  Genes retained: %d", contrast_qc$gene_filter$genes_retained),
+                    sprintf("  Genes removed: %d", contrast_qc$gene_filter$genes_removed),
+                    sprintf("  Audit table: %s", de_gene_filter_audit_filename)
+                )
+            } else {
+                sprintf("  Status: %s", de_gene_filter_rule(gene_filter))
+            },
+            "",
             "DGE Results:",
             sprintf("  Status: %s", contrast_qc$dge_status),
             sprintf("  Genes tested: %d", contrast_qc$genes_tested),
@@ -1164,6 +1516,11 @@ main_run_de_analysis <- function(args) {
                 )
             } else {
                 c(
+                    if (identical(contrast_qc$dge_failure_reason, "no_genes_passed_expression_filter")) {
+                        "  Reason: no genes passed the gene expression prefilter; no test was performed"
+                    } else {
+                        NULL
+                    },
                     "  Significant (FDR < 0.05): N/A",
                     "  Significant (FDR < 0.01): N/A",
                     "  Upregulated: N/A",
@@ -1209,6 +1566,10 @@ main_run_de_analysis <- function(args) {
         function(cqc) identical(cqc$dtu_status, "FAILED"),
         de_qc_stats$contrasts
     ))
+    no_genes_passed_filter_contrasts <- names(Filter(
+        function(cqc) identical(cqc$dge_failure_reason, "no_genes_passed_expression_filter"),
+        de_qc_stats$contrasts
+    ))
 
     deseq2_dispersion_fallbacks <- names(Filter(
         function(cqc) isTRUE(cqc$deseq2_dispersion_fallback$applied),
@@ -1251,6 +1612,8 @@ main_run_de_analysis <- function(args) {
         failed_dge_contrast_names = as.list(failed_dge_contrasts),
         failed_dtu_contrasts = length(failed_dtu_contrasts),
         failed_dtu_contrast_names = as.list(failed_dtu_contrasts),
+        dge_no_genes_passed_filter_contrasts = length(no_genes_passed_filter_contrasts),
+        dge_no_genes_passed_filter_contrast_names = as.list(no_genes_passed_filter_contrasts),
         deseq2_dispersion_fallback_contrasts = length(deseq2_dispersion_fallbacks),
         deseq2_dispersion_fallback_contrast_names = as.list(deseq2_dispersion_fallbacks),
         deseq2_gene_wise_contrasts = length(deseq2_gene_wise),
@@ -1284,6 +1647,7 @@ main_run_de_analysis <- function(args) {
         sprintf("Condition column: %s", de_qc_stats$condition_column),
         sprintf("Reference level: %s", de_qc_stats$reference_level),
         sprintf("Covariates: %s", paste(de_qc_stats$covariates, collapse = ", ")),
+        sprintf("Gene expression prefilter (DGE only): %s", de_gene_filter_rule(gene_filter)),
         "",
         "Sample Sizes:",
         sapply(names(de_qc_stats$samples_per_group), function(grp) {
@@ -1302,8 +1666,20 @@ main_run_de_analysis <- function(args) {
                 sprintf("  %s:", cname),
                 sprintf("    Samples: %d (%d vs %d)", cqc$n_samples, cqc$n_target, cqc$n_reference),
                 sprintf("    DGE status: %s", cqc$dge_status),
+                if (isTRUE(cqc$gene_filter$enabled)) {
+                    sprintf(
+                        "    DGE genes tested: %d of %d (%d removed by prefilter)",
+                        cqc$gene_filter$genes_retained,
+                        cqc$gene_filter$genes_input,
+                        cqc$gene_filter$genes_removed
+                    )
+                } else {
+                    sprintf("    DGE genes tested: %d", cqc$genes_tested)
+                },
                 if (cqc$dge_status == "SUCCESS") {
                     sprintf("    DGE significant: %d genes (FDR<0.05)", cqc$dge_significant_fdr05)
+                } else if (identical(cqc$dge_failure_reason, "no_genes_passed_expression_filter")) {
+                    "    DGE significant: N/A (no genes passed the prefilter; no test performed)"
                 } else {
                     "    DGE significant: N/A (analysis failed)"
                 },

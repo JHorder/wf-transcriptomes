@@ -5,6 +5,12 @@
   primary condition column, and any columns named in `--covariates`.
 + DE/DTU requires at least two condition levels and at least two samples per
   level.
++ `--de_min_count` and `--de_min_samples` must both be 0 or both be at least 1,
+  and `--de_min_samples` cannot exceed the number of samples in any contrast.
++ If a contrast reports that no genes passed the gene expression prefilter, no
+  DGE test was run for it. Lower `--de_min_count` or `--de_min_samples`, and use
+  `de_analysis/<contrast>/gene_expression_filter.tsv` to see how many samples
+  supported each gene.
 + See how to interpret common Nextflow exit codes
   [here](https://epi2me.nanoporetech.com/epi2me-docs/help/troubleshooting/).
 

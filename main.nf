@@ -15,6 +15,55 @@ include { mods } from './subworkflows/mods'
 OPTIONAL_FILE = file("$projectDir/data/OPTIONAL_FILE")
 
 
+// Check the DGE gene expression prefilter at launch so that impossible settings
+// fail before any compute. `supeRglue de_analysis` enforces the same rules.
+def validate_de_gene_filter(sample_sheet) {
+    int min_count = params.de_min_count as int
+    int min_samples = params.de_min_samples as int
+    if (!params.de_analysis) {
+        if (min_count || min_samples) {
+            log.warn "--de_min_count and --de_min_samples have no effect without --de_analysis."
+        }
+        return
+    }
+    if (min_count < 0 || min_samples < 0) {
+        throw new Exception("--de_min_count and --de_min_samples must be non-negative integers.")
+    }
+    if ((min_count > 0) != (min_samples > 0)) {
+        throw new Exception(
+            "--de_min_count (${min_count}) and --de_min_samples (${min_samples}) must either " +
+            "both be 0 (gene expression prefilter disabled) or both be at least 1 " +
+            "(prefilter enabled), for example --de_min_count 10 --de_min_samples 3."
+        )
+    }
+    if (min_samples == 0 || sample_sheet == OPTIONAL_FILE) {
+        return
+    }
+    // Each contrast holds the reference level's samples plus one other level's.
+    String reference_level = params.reference_level ?: "control"
+    Map group_sizes = sample_sheet
+        .splitCsv(header: true, quote: '"')
+        .findAll { it[params.condition_column] != null }
+        .countBy { it[params.condition_column] }
+    if (!group_sizes.containsKey(reference_level)) {
+        return
+    }
+    Map too_small = group_sizes
+        .findAll { level, n -> level != reference_level }
+        .collectEntries { level, n ->
+            ["${params.condition_column}_${level}_vs_${reference_level}", n + group_sizes[reference_level]]
+        }
+        .findAll { contrast, n -> n < min_samples }
+    if (too_small) {
+        throw new Exception(
+            "--de_min_samples (${min_samples}) exceeds the number of samples in " +
+            too_small.collect { contrast, n -> "${contrast} (${n} samples)" }.join(", ") +
+            ". No gene could pass the gene expression prefilter."
+        )
+    }
+}
+
+
 process getVersions {
     label "wf_transcriptomes"
     publishDir "${params.out_dir}", mode: 'copy', pattern: "versions.txt"
@@ -253,6 +302,7 @@ workflow {
     if (sample_sheet != OPTIONAL_FILE && !sample_sheet.exists()) {
         throw new Exception("--sample_sheet does not exist.")
     }
+    validate_de_gene_filter(sample_sheet)
 
     def ingress_args = [
         "minimap2_memory": ["31GB", "62GB"],

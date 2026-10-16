@@ -22,6 +22,8 @@ process runDifferentialAnalysis {
         --condition_column "${params.condition_column}" \
         ${covariates_arg} \
         ${reference_arg} \
+        --de_min_count ${params.de_min_count} \
+        --de_min_samples ${params.de_min_samples} \
         --out_dir de_analysis
     """
 }

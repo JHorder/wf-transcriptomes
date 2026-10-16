@@ -680,6 +680,43 @@ def _collect_de_method_rows(de_qc):
     return rows, deseq2_gene_wise, dexseq_gene_wise, dexseq_covariate_drops, failed_dge
 
 
+NO_GENES_PASSED_FILTER = "no_genes_passed_expression_filter"
+
+
+def _gene_filter_rule(settings):
+    """Describe the DGE gene expression prefilter settings in words."""
+    if not settings or not settings.get("enabled"):
+        return "Disabled (all genes passed to DESeq2)"
+    return (
+        f"Rounded count ≥ {settings.get('min_count')} in "
+        f"≥ {settings.get('min_samples')} samples of each contrast"
+    )
+
+
+def _collect_gene_filter_rows(de_qc):
+    """Build per-contrast DGE prefilter rows from DE QC metadata."""
+    rows = []
+    for contrast_name, contrast_data in de_qc.get("contrasts", {}).items():
+        gene_filter = contrast_data.get("gene_filter")
+        if not isinstance(gene_filter, dict):
+            continue
+        n_samples = contrast_data.get(
+            "n_samples",
+            contrast_data.get("n_target", 0) + contrast_data.get("n_reference", 0),
+        )
+        rows.append(
+            {
+                "Contrast": contrast_name,
+                "Samples": n_samples,
+                "Genes before prefilter": gene_filter.get("genes_input", "N/A"),
+                "Genes retained (tested)": gene_filter.get("genes_retained", "N/A"),
+                "Genes removed": gene_filter.get("genes_removed", "N/A"),
+                "Audit table": gene_filter.get("audit_file") or "N/A",
+            }
+        )
+    return rows
+
+
 def main(args):
     """Run the report entry point."""
     logger = get_named_logger("Report")
@@ -1220,6 +1257,16 @@ def main(args):
                     )
                     has_warnings = True
 
+                gene_filter_settings = de_qc.get("gene_expression_filter")
+                no_genes_passed_filter = [
+                    contrast_name
+                    for contrast_name, contrast_data in de_qc.get(
+                        "contrasts", {}
+                    ).items()
+                    if contrast_data.get("dge_failure_reason")
+                    == NO_GENES_PASSED_FILTER
+                ]
+
                 if failed_dge:
                     _create_warning_banner(
                         "DGE Analysis Failed: "
@@ -1227,6 +1274,19 @@ def main(args):
                         "DGE testing. "
                         f"Affected: {', '.join(failed_dge)}. "
                         "See DGE_ANALYSIS_FAILED.txt files for details.",
+                        level="danger",
+                    )
+                    has_warnings = True
+
+                if no_genes_passed_filter:
+                    _create_warning_banner(
+                        "No genes passed the gene expression prefilter "
+                        f"({_gene_filter_rule(gene_filter_settings)}) for: "
+                        f"{', '.join(no_genes_passed_filter)}. No differential "
+                        "gene expression test was performed for these contrasts, "
+                        "so their empty results do not mean that no genes are "
+                        "differentially expressed. Lower --de_min_count or "
+                        "--de_min_samples to test them.",
                         level="danger",
                     )
                     has_warnings = True
@@ -1270,7 +1330,17 @@ def main(args):
                             "Number of contrasts",
                             de_qc.get("num_contrasts", 0),
                         ),
-                    ],
+                    ]
+                    + (
+                        [
+                            (
+                                "Gene expression prefilter (DGE only)",
+                                _gene_filter_rule(gene_filter_settings),
+                            )
+                        ]
+                        if gene_filter_settings is not None
+                        else []
+                    ),
                     columns=["Parameter", "Value"],
                 )
                 DataTable.from_pandas(
@@ -1321,6 +1391,25 @@ def main(args):
                 else:
                     p("No contrast-level QC metadata was found.")
 
+                if gene_filter_settings is not None:
+                    h4("Gene Expression Prefilter (DGE only)")
+                    p(
+                        "Before DESeq2 estimates size factors and dispersions, "
+                        "each contrast can be restricted to genes with enough "
+                        "supporting samples. Only that contrast's samples are "
+                        "considered, from either condition. This prefilter is "
+                        "separate from DESeq2's independent filtering and does "
+                        "not affect differential transcript usage. Setting: "
+                        f"{_gene_filter_rule(gene_filter_settings)}."
+                    )
+                    gene_filter_rows = _collect_gene_filter_rows(de_qc)
+                    if gene_filter_settings.get("enabled") and gene_filter_rows:
+                        DataTable.from_pandas(
+                            pd.DataFrame(gene_filter_rows),
+                            paging=False,
+                            use_index=False,
+                        )
+
                 # Per-contrast summary
                 if "contrasts" in de_qc:
                     h4("Results Summary by Contrast")
@@ -1341,6 +1430,11 @@ def main(args):
                                 ),
                                 "DGE Status": contrast_data.get(
                                     "dge_status", "N/A"
+                                ),
+                                "DGE Genes Tested": (
+                                    contrast_data.get("genes_tested", "N/A")
+                                    if contrast_data.get("dge_status") == "SUCCESS"
+                                    else "N/A"
                                 ),
                                 "DGE Significant (FDR<0.05)": (
                                     contrast_data.get(
@@ -1427,6 +1521,16 @@ def main(args):
                                 ),
                             }
                         )
+                    if no_genes_passed_filter:
+                        warnings_data.append(
+                            {
+                                "Warning Type": "DGE Prefilter Removed All Genes",
+                                "Details": (
+                                    f"{len(no_genes_passed_filter)} contrasts "
+                                    "not tested"
+                                ),
+                            }
+                        )
 
                     warnings_df = pd.DataFrame(warnings_data)
                     DataTable.from_pandas(warnings_df, paging=False, use_index=False)
@@ -1502,6 +1606,19 @@ def main(args):
                                 with p():
                                     strong("Note: ")
                                     raw(contrast_data["dtu_power_warning"])
+                        gene_filter = contrast_data.get("gene_filter") or {}
+                        if gene_filter.get("enabled"):
+                            _create_warning_banner(
+                                "Gene expression prefilter "
+                                f"({_gene_filter_rule(gene_filter)}): "
+                                f"{gene_filter.get('genes_retained')} of "
+                                f"{gene_filter.get('genes_input')} genes retained, "
+                                f"{gene_filter.get('genes_removed')} removed before "
+                                "DESeq2 fitting. The table, volcano and MA plots, "
+                                "and significance counts include only retained "
+                                "genes.",
+                                level="info",
+                            )
                     DataTable.from_pandas(
                         _round_de_table(table.head(args.de_table_size)),
                         use_index=False

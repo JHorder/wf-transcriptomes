@@ -184,6 +184,14 @@
       "optional": true,
       "type": "aggregated"
     },
+    "dge-gene-expression-filter": {
+      "filepath": "de_analysis/{{ contrast }}/gene_expression_filter.tsv",
+      "title": "DGE gene expression prefilter audit",
+      "description": "Written when --de_min_count and --de_min_samples are set. One row per gene in the contrast with the number of samples (overall, target and reference) whose rounded count met --de_min_count, and whether the gene was retained for DESeq2 or excluded.",
+      "mime-type": "text/tab-separated-values",
+      "optional": true,
+      "type": "aggregated"
+    },
     "dtu-transcript-results": {
       "filepath": "de_analysis/{{ contrast }}/results_dtu_transcript.tsv",
       "title": "Differential transcript usage results",
@@ -219,7 +227,7 @@
     "de-qc-stats": {
       "filepath": "de_analysis/de_qc_stats.json",
       "title": "Differential analysis QC summary",
-      "description": "Structured DE/DTU QC summary. Use analysis_fallbacks for aggregate counts, and each contrast's deseq2_dispersion_fallback, dexseq_dispersion_method, and dexseq_covariates_dropped fields for interpretation.",
+      "description": "Structured DE/DTU QC summary. Use analysis_fallbacks for aggregate counts, and each contrast's deseq2_dispersion_fallback, dexseq_dispersion_method, and dexseq_covariates_dropped fields for interpretation. gene_expression_filter records the DGE prefilter settings, and each contrast's gene_filter records the genes before filtering, retained and removed.",
       "mime-type": "application/json",
       "optional": true,
       "type": "aggregated"
@@ -251,7 +259,7 @@
     "dge-analysis-failed-diagnostic": {
       "filepath": "de_analysis/{{ contrast }}/DGE_ANALYSIS_FAILED.txt",
       "title": "DGE failure diagnostic",
-      "description": "Diagnostic details when DESeq2 fails for a contrast.",
+      "description": "Diagnostic details when DESeq2 fails for a contrast, or when no genes pass the gene expression prefilter.",
       "mime-type": "text/plain",
       "optional": true,
       "type": "aggregated"

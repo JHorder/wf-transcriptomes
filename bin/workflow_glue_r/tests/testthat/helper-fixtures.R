@@ -391,3 +391,141 @@ write_degenerate_de_fixture_bundle <- function(out_dir) {
         sample_sheet = sample_sheet
     )
 }
+
+#' Per-condition replicate counts for genes designed around the DGE
+#' prefilter boundaries with --de_min_count 10 --de_min_samples 3.
+#'
+#' Expected outcome in a control vs treated contrast:
+#' - retained: target_only, reference_only, exact_boundary, rounds_up,
+#'   rounds_half_even, mixed_conditions
+#' - excluded: singleton, below_count, below_samples, rounds_down,
+#'   third_only, third_tips_balance, all_zero
+#' In a control vs treated2 contrast, third_only and third_tips_balance are
+#' retained because their support comes from treated2 samples.
+gene_filter_designed_counts <- function() {
+    zeros <- c(0, 0, 0)
+    list(
+        # Mirrors the motivating case: nonzero in one sample, zero in five.
+        singleton = list(control = zeros, treated = c(0, 50, 0), treated2 = zeros),
+        target_only = list(control = zeros, treated = c(25, 30, 20), treated2 = zeros),
+        reference_only = list(control = c(15, 12, 18), treated = zeros, treated2 = zeros),
+        exact_boundary = list(control = c(10, 10, 10), treated = c(9, 9, 9), treated2 = c(9, 9, 9)),
+        below_count = list(control = c(9, 9, 9), treated = c(9, 9, 9), treated2 = c(9, 9, 9)),
+        below_samples = list(control = c(40, 40, 9), treated = c(9, 0, 0), treated2 = zeros),
+        # Unrounded 9.6 is below 10; DESeq2 sees round(9.6) = 10.
+        rounds_up = list(control = c(9.6, 9.6, 9.6), treated = zeros, treated2 = zeros),
+        # R rounds half to even, so 9.5 becomes 10, matching DESeq2's input.
+        rounds_half_even = list(control = zeros, treated = c(9.5, 9.5, 9.5), treated2 = zeros),
+        rounds_down = list(control = c(9.4, 9.4, 9.4), treated = c(9.4, 9.4, 9.4), treated2 = c(9.4, 9.4, 9.4)),
+        mixed_conditions = list(control = c(12, 0, 0), treated = c(11, 0, 13), treated2 = zeros),
+        third_only = list(control = zeros, treated = zeros, treated2 = c(30, 35, 40)),
+        # Only two qualifying samples unless treated2 samples leak into the
+        # control vs treated contrast.
+        third_tips_balance = list(control = c(10, 10, 0), treated = zeros, treated2 = c(10, 10, 10)),
+        all_zero = list(control = zeros, treated = zeros, treated2 = zeros)
+    )
+}
+
+#' Build gene and transcript counts for DGE prefilter tests.
+#'
+#' Thirty deterministic, well-expressed background genes (five of them
+#' 4-fold up in `treated`) give DESeq2 enough data to fit, alongside the
+#' designed boundary genes from `gene_filter_designed_counts()`. Each gene is
+#' split into two transcripts so DEXSeq can run on the same samples.
+#'
+#' @param levels Condition levels, three replicates each.
+#' @return A list with `gene_counts`, `tx_counts`, `tx_meta`,
+#'   `sample_names` and `conditions`.
+make_gene_filter_counts <- function(levels = c("control", "treated")) {
+    conditions <- rep(levels, each = 3)
+    sample_names <- sprintf("%s_rep%d", conditions, rep(seq_len(3), length(levels)))
+    size_factors <- rep(c(1, 1.15, 0.85), length(levels)) *
+        rep(seq(0.9, 1.1, length.out = length(levels)), each = 3)
+
+    n_background <- 30
+    background <- t(vapply(seq_len(n_background), function(g) {
+        base_mean <- 50 * 1.13^g
+        fold_change <- ifelse(g <= 5 & conditions == "treated", 4, 1)
+        noise <- 1 + 0.2 * sin(g * 1.7 + seq_along(conditions) * 2.3)
+        round(base_mean * size_factors * fold_change * noise)
+    }, numeric(length(conditions))))
+    rownames(background) <- sprintf("bg%02d", seq_len(n_background))
+
+    designed_spec <- gene_filter_designed_counts()
+    designed <- t(vapply(designed_spec, function(spec) {
+        unlist(lapply(levels, function(level) spec[[level]]), use.names = FALSE)
+    }, numeric(length(conditions))))
+    rownames(designed) <- names(designed_spec)
+
+    gene_counts <- rbind(background, designed)
+    colnames(gene_counts) <- sample_names
+
+    # Two transcripts per gene; background genes 1-4 switch isoform usage in
+    # the second condition level to give DEXSeq some signal.
+    tx_prop <- t(vapply(seq_len(nrow(gene_counts)), function(g) {
+        base_prop <- 0.3 + 0.2 * (g %% 3)
+        ifelse(g <= 4 & conditions == levels[[2]], 1 - base_prop, base_prop)
+    }, numeric(length(conditions))))
+    tx_counts <- rbind(gene_counts * tx_prop, gene_counts * (1 - tx_prop))
+    gene_ids <- rep(rownames(gene_counts), 2)
+    tx_names <- paste0(gene_ids, rep(c("_tx1", "_tx2"), each = nrow(gene_counts)))
+    tx_order <- order(gene_ids, tx_names)
+    tx_counts <- tx_counts[tx_order, , drop = FALSE]
+    dimnames(tx_counts) <- list(tx_names[tx_order], sample_names)
+
+    list(
+        gene_counts = gene_counts,
+        tx_counts = tx_counts,
+        tx_meta = data.frame(
+            TXNAME = tx_names[tx_order],
+            GENEID = gene_ids[tx_order],
+            stringsAsFactors = FALSE
+        ),
+        sample_names = sample_names,
+        conditions = conditions
+    )
+}
+
+#' Write a DE input bundle for DGE prefilter tests.
+#'
+#' @param out_dir Directory to write the output files.
+#' @param levels Condition levels, three replicates each.
+#' @return A list with paths to the transcript RDS, gene RDS, and sample sheet CSV.
+write_gene_filter_fixture_bundle <- function(out_dir, levels = c("control", "treated")) {
+    fixture <- make_gene_filter_counts(levels)
+
+    tx_se <- SummarizedExperiment::SummarizedExperiment(
+        assays = list(counts = fixture$tx_counts),
+        rowData = S4Vectors::DataFrame(fixture$tx_meta)
+    )
+    gene_se <- SummarizedExperiment::SummarizedExperiment(
+        assays = list(counts = fixture$gene_counts),
+        rowData = S4Vectors::DataFrame(
+            GENEID = rownames(fixture$gene_counts),
+            gene_name = toupper(rownames(fixture$gene_counts))
+        )
+    )
+
+    tx_path <- file.path(out_dir, "transcripts.rds")
+    gene_path <- file.path(out_dir, "genes.rds")
+    saveRDS(tx_se, tx_path)
+    saveRDS(gene_se, gene_path)
+
+    sample_sheet <- file.path(out_dir, "sample_sheet.csv")
+    utils::write.csv(
+        data.frame(
+            alias = fixture$sample_names,
+            condition = fixture$conditions,
+            stringsAsFactors = FALSE
+        ),
+        sample_sheet,
+        row.names = FALSE,
+        quote = FALSE
+    )
+
+    list(
+        transcript_rds = tx_path,
+        gene_rds = gene_path,
+        sample_sheet = sample_sheet
+    )
+}

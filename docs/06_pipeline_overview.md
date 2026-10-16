@@ -133,6 +133,48 @@ differential transcript usage. These analyses use the shared `bambu` outputs
 and the design columns in the sample sheet, and each comparison is written to
 its own subdirectory under `de_analysis/<contrast>/`.
 
+#### Optional gene expression prefilter for differential gene expression
+
+By default every gene in the cohort gene count matrix is passed to `DESeq2`.
+To remove weakly supported genes before model fitting, set both
+`--de_min_count` and `--de_min_samples`, for example:
+
+```
+--de_analysis --de_min_count 10 --de_min_samples 3
+```
+
+The prefilter is applied separately to each pairwise contrast, using only the
+samples of that contrast's two conditions; samples of any other condition do not
+count. Counts are rounded exactly as they are for `DESeq2`, and a gene is kept
+when at least `--de_min_samples` of those samples, from either condition, have a
+rounded count of at least `--de_min_count`. A gene expressed in all replicates of
+only one condition can therefore be kept, while a gene supported by a single
+sample is removed. The prefilter runs before `DESeq2` estimates size factors and
+dispersions, so those estimates use only the retained genes.
+
+The prefilter is separate from `DESeq2`'s independent filtering, which still
+runs after testing when adjusted p-values are calculated (genes it filters
+have `padj` set to `NA`). Because the prefilter changes which genes are tested
+and the data used for normalisation and dispersion estimation, the number of
+significant genes can change in either direction.
+
+Leaving both parameters at 0 (the default) disables the prefilter. Setting only
+one of them, or setting `--de_min_samples` higher than the number of samples in
+any contrast, is rejected when the workflow starts. The prefilter applies only to
+differential gene expression: DTU, transcript discovery, quantification, the
+cohort count tables, and the report's cohort heatmaps and PCA use all genes and
+transcripts.
+
+When the prefilter is enabled, each contrast directory also contains
+`gene_expression_filter.tsv`, listing every gene with the number of samples that
+met `--de_min_count` (overall, and in the target and reference conditions) and
+whether it was retained or excluded. The settings and the number of genes before
+filtering, retained and removed for each contrast are recorded in
+`de_analysis/de_qc_stats.json`, the text summaries, and the report, and the
+reported number of genes tested is the number retained. If no gene passes for a
+contrast, its DGE status is `FAILED`, `DGE_ANALYSIS_FAILED.txt` explains why, and
+no test is reported for that contrast rather than zero significant genes.
+
 ### 9. What you need to provide
 
 The workflow's analysis is controlled by a user provided genome, annotation, and

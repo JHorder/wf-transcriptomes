@@ -838,3 +838,481 @@ testthat::test_that("degenerate control-vs-control data completes gracefully", {
     testthat::expect_true(!is.null(fallbacks$failed_dge_contrasts))
     testthat::expect_true(!is.null(fallbacks$failed_dtu_contrasts))
 })
+
+###
+# DGE gene expression prefilter
+#
+# Optional --de_min_count / --de_min_samples filter applied per contrast,
+# after selecting the contrast's samples and before DESeq2 fitting. Fixtures
+# from make_gene_filter_counts() place genes on either side of the 10 / 3
+# boundaries; see gene_filter_designed_counts() for the expected outcomes.
+
+gene_filter_10_3 <- list(enabled = TRUE, min_count = 10L, min_samples = 3L)
+
+gene_filter_two_level_counts <- function() {
+    make_gene_filter_counts(c("control", "treated"))$gene_counts
+}
+
+read_de_tsv <- function(path) {
+    utils::read.delim(path, check.names = FALSE, stringsAsFactors = FALSE)
+}
+
+run_gene_filter_de <- function(
+    levels = c("control", "treated"),
+    de_min_count = NULL,
+    de_min_samples = NULL
+) {
+    fixture_dir <- tempfile("de-gene-filter-")
+    dir.create(fixture_dir)
+    bundle <- write_gene_filter_fixture_bundle(fixture_dir, levels = levels)
+    argv <- c(
+        bundle,
+        list(
+            condition_column = "condition",
+            reference_level = "control",
+            out_dir = file.path(fixture_dir, "out")
+        )
+    )
+    argv$de_min_count <- de_min_count
+    argv$de_min_samples <- de_min_samples
+    argv <- workflow_glue_r_normalise_args(argv, de_analysis_arg_spec())
+    suppressWarnings(suppressMessages(main_run_de_analysis(argv)))
+    list(
+        out_dir = argv$out_dir,
+        qc = jsonlite::read_json(
+            file.path(argv$out_dir, "de_qc_stats.json"),
+            simplifyVector = TRUE
+        )
+    )
+}
+
+# DESeq2 results for a count matrix via the unchanged v2.0.3 fitting path,
+# keyed by GENEID for comparison with results_dge.tsv.
+direct_deseq2_results <- function(count_mat, target_level = "treated") {
+    conditions <- sub("_rep[0-9]+$", "", colnames(count_mat))
+    coldata <- data.frame(
+        alias = colnames(count_mat),
+        condition = stats::relevel(factor(conditions), ref = "control"),
+        stringsAsFactors = FALSE
+    )
+    out_dir <- tempfile("direct-deseq2-")
+    dir.create(out_dir)
+    run <- suppressWarnings(suppressMessages(de_run_deseq2_result(
+        count_mat,
+        coldata,
+        target_level,
+        "control",
+        "condition",
+        character(0),
+        out_dir,
+        "direct"
+    )))
+    result <- as.data.frame(run$result)
+    result$GENEID <- rownames(result)
+    result
+}
+
+expect_dge_matches <- function(observed, expected) {
+    observed <- observed[match(expected$GENEID, observed$GENEID), , drop = FALSE]
+    testthat::expect_equal(observed$GENEID, expected$GENEID)
+    for (column in c("baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj")) {
+        testthat::expect_equal(
+            observed[[column]],
+            expected[[column]],
+            tolerance = 1e-8,
+            info = column
+        )
+    }
+}
+
+testthat::test_that("gene prefilter settings: 0/0 disables, pairs enable, partial or invalid rejected", {
+    disabled <- de_gene_filter_settings()
+    testthat::expect_false(disabled$enabled)
+    testthat::expect_identical(de_gene_filter_settings(0L, 0L), disabled)
+    testthat::expect_identical(de_gene_filter_settings(NULL, NULL), disabled)
+
+    enabled <- de_gene_filter_settings(10L, 3L)
+    testthat::expect_true(enabled$enabled)
+    testthat::expect_identical(enabled$min_count, 10L)
+    testthat::expect_identical(enabled$min_samples, 3L)
+
+    testthat::expect_error(de_gene_filter_settings(10L, 0L), "must either both be 0")
+    testthat::expect_error(de_gene_filter_settings(0L, 3L), "must either both be 0")
+    testthat::expect_error(de_gene_filter_settings(-1, 3L), "--de_min_count must be a non-negative integer")
+    testthat::expect_error(de_gene_filter_settings(10L, 2.5), "--de_min_samples must be a non-negative integer")
+    testthat::expect_error(de_gene_filter_settings("10", 3L), "--de_min_count must be a non-negative integer")
+})
+
+testthat::test_that("gene prefilter arguments default to disabled and reject bad values", {
+    base_argv <- list(
+        transcript_rds = "transcripts.rds",
+        gene_rds = "genes.rds",
+        sample_sheet = "sample_sheet.csv"
+    )
+    defaults <- workflow_glue_r_normalise_args(base_argv, de_analysis_arg_spec())
+    testthat::expect_identical(defaults$de_min_count, 0L)
+    testthat::expect_identical(defaults$de_min_samples, 0L)
+
+    parsed <- workflow_glue_r_normalise_args(
+        argparser::parse_args(
+            de_analysis_arg_parser(),
+            argv = c(
+                "--transcript_rds", "t.rds", "--gene_rds", "g.rds", "--sample_sheet", "s.csv",
+                "--de_min_count", "10", "--de_min_samples", "3"
+            )
+        ),
+        de_analysis_arg_spec()
+    )
+    testthat::expect_identical(parsed$de_min_count, 10L)
+    testthat::expect_identical(parsed$de_min_samples, 3L)
+
+    testthat::expect_error(
+        workflow_glue_r_normalise_args(c(base_argv, list(de_min_count = -1)), de_analysis_arg_spec()),
+        "--de_min_count must be a non-negative integer"
+    )
+    testthat::expect_error(
+        workflow_glue_r_normalise_args(c(base_argv, list(de_min_samples = 2.5)), de_analysis_arg_spec()),
+        "--de_min_samples must be a non-negative integer"
+    )
+    # Settings are checked before any input is read.
+    testthat::expect_error(
+        run_de_analysis_cli(c(
+            "--transcript_rds", "missing.rds", "--gene_rds", "missing.rds",
+            "--sample_sheet", "missing.csv", "--de_min_count", "10"
+        )),
+        "must either both be 0"
+    )
+})
+
+testthat::test_that("disabled gene prefilter returns the count matrix untouched", {
+    counts <- gene_filter_two_level_counts()
+    result <- de_apply_gene_expression_filter(counts, de_gene_filter_settings())
+
+    # Unrounded values and every row are passed on exactly as before.
+    testthat::expect_identical(result$counts, counts)
+    testthat::expect_null(result$keep)
+    testthat::expect_equal(result$n_input, nrow(counts))
+    testthat::expect_equal(result$n_retained, nrow(counts))
+    testthat::expect_equal(result$n_removed, 0)
+})
+
+testthat::test_that("gene prefilter thresholds are inclusive at both boundaries", {
+    result <- de_apply_gene_expression_filter(gene_filter_two_level_counts(), gene_filter_10_3)
+
+    # Exactly 10 counts in exactly 3 samples passes.
+    testthat::expect_true(result$keep[["exact_boundary"]])
+    # 9 counts everywhere fails the count threshold.
+    testthat::expect_false(result$keep[["below_count"]])
+    # 10+ counts in only 2 samples fails the sample threshold.
+    testthat::expect_false(result$keep[["below_samples"]])
+    testthat::expect_equal(sum(result$meets_min_count["below_samples", ]), 2)
+})
+
+testthat::test_that("gene prefilter rounds counts before applying thresholds", {
+    counts <- gene_filter_two_level_counts()
+    result <- de_apply_gene_expression_filter(counts, gene_filter_10_3)
+
+    # 9.6 rounds to 10; unrounded it would fail the threshold.
+    testthat::expect_true(all(counts["rounds_up", 1:3] < 10))
+    testthat::expect_true(result$keep[["rounds_up"]])
+    # R rounds half to even, matching the round() applied for DESeq2.
+    testthat::expect_true(result$keep[["rounds_half_even"]])
+    testthat::expect_false(result$keep[["rounds_down"]])
+
+    # Retained counts are the rounded values DESeq2 receives.
+    testthat::expect_identical(result$counts, round(counts)[result$keep, , drop = FALSE])
+    testthat::expect_equal(unname(result$counts["rounds_up", 1:3]), c(10, 10, 10))
+})
+
+testthat::test_that("10/3 prefilter removes singleton genes and keeps one-condition genes", {
+    result <- de_apply_gene_expression_filter(gene_filter_two_level_counts(), gene_filter_10_3)
+
+    testthat::expect_false(result$keep[["singleton"]])
+    testthat::expect_false(result$keep[["all_zero"]])
+    # Expression in all three samples of either condition is enough.
+    testthat::expect_true(result$keep[["target_only"]])
+    testthat::expect_true(result$keep[["reference_only"]])
+    # Qualifying samples may come from both conditions.
+    testthat::expect_true(result$keep[["mixed_conditions"]])
+    testthat::expect_true(all(result$keep[grepl("^bg", names(result$keep))]))
+    testthat::expect_equal(result$n_retained, 36)
+    testthat::expect_equal(result$n_removed, 7)
+})
+
+testthat::test_that("gene prefilter rejects de_min_samples larger than a contrast", {
+    sizes <- c(condition_treated_vs_control = 6L, condition_treated2_vs_control = 5L)
+
+    testthat::expect_silent(de_validate_gene_filter_contrasts(gene_filter_10_3, sizes))
+    testthat::expect_silent(
+        de_validate_gene_filter_contrasts(de_gene_filter_settings(10L, 5L), sizes)
+    )
+    testthat::expect_error(
+        de_validate_gene_filter_contrasts(de_gene_filter_settings(10L, 6L), sizes),
+        "condition_treated2_vs_control \\(5 samples\\).*at most 5"
+    )
+    # Disabled settings are never checked against contrast sizes.
+    testthat::expect_silent(de_validate_gene_filter_contrasts(de_gene_filter_settings(), c(x = 0L)))
+
+    fixture_dir <- tempfile("de-gene-filter-impossible-")
+    dir.create(fixture_dir)
+    bundle <- write_gene_filter_fixture_bundle(fixture_dir)
+    argv <- workflow_glue_r_normalise_args(
+        c(bundle, list(
+            reference_level = "control",
+            de_min_count = 10L,
+            de_min_samples = 7L,
+            out_dir = file.path(fixture_dir, "out")
+        )),
+        de_analysis_arg_spec()
+    )
+    testthat::expect_error(
+        suppressWarnings(main_run_de_analysis(argv)),
+        "--de_min_samples \\(7\\) exceeds the number of samples in contrast: condition_treated_vs_control \\(6 samples\\)"
+    )
+    # Rejected before any contrast is fitted.
+    testthat::expect_false(dir.exists(file.path(argv$out_dir, "condition_treated_vs_control")))
+})
+
+testthat::test_that("disabled gene prefilter preserves the unfiltered DESeq2 analysis", {
+    run <- run_gene_filter_de()
+    contrast <- "condition_treated_vs_control"
+    contrast_dir <- file.path(run$out_dir, contrast)
+    counts <- gene_filter_two_level_counts()
+
+    expect_dge_matches(
+        read_de_tsv(file.path(contrast_dir, "results_dge.tsv")),
+        direct_deseq2_results(counts)
+    )
+    contrast_qc <- run$qc$contrasts[[contrast]]
+    testthat::expect_false(run$qc$gene_expression_filter$enabled)
+    testthat::expect_false(contrast_qc$gene_filter$enabled)
+    testthat::expect_equal(contrast_qc$genes_tested, nrow(counts))
+    testthat::expect_equal(contrast_qc$dge_total_genes, nrow(counts))
+    testthat::expect_equal(contrast_qc$gene_filter$genes_removed, 0)
+    testthat::expect_null(contrast_qc$gene_filter$audit_file)
+    testthat::expect_false(file.exists(file.path(contrast_dir, de_gene_filter_audit_filename)))
+
+    # Explicit 0/0 is the same disabled state as the defaults.
+    explicit <- run_gene_filter_de(de_min_count = 0L, de_min_samples = 0L)
+    testthat::expect_equal(
+        read_de_tsv(file.path(explicit$out_dir, contrast, "results_dge.tsv")),
+        read_de_tsv(file.path(contrast_dir, "results_dge.tsv")),
+        tolerance = 1e-8
+    )
+})
+
+testthat::test_that("enabled gene prefilter fits DESeq2 on retained genes only and leaves DTU unchanged", {
+    unfiltered <- run_gene_filter_de()
+    filtered <- run_gene_filter_de(de_min_count = 10L, de_min_samples = 3L)
+    contrast <- "condition_treated_vs_control"
+    contrast_dir <- file.path(filtered$out_dir, contrast)
+
+    audit <- read_de_tsv(file.path(contrast_dir, de_gene_filter_audit_filename))
+    testthat::expect_equal(
+        names(audit),
+        c(
+            "GENEID", "gene_name", "n_samples_meeting_min_count",
+            "n_target_samples_meeting_min_count", "n_reference_samples_meeting_min_count",
+            "filter_status"
+        )
+    )
+    status <- stats::setNames(audit$filter_status, audit$GENEID)
+    testthat::expect_equal(
+        sort(names(status)[status == "excluded"]),
+        sort(c(
+            "singleton", "below_count", "below_samples", "rounds_down",
+            "third_only", "third_tips_balance", "all_zero"
+        ))
+    )
+    singleton <- audit[audit$GENEID == "singleton", ]
+    testthat::expect_equal(singleton$n_samples_meeting_min_count, 1)
+    testthat::expect_equal(singleton$n_target_samples_meeting_min_count, 1)
+    target_only <- audit[audit$GENEID == "target_only", ]
+    testthat::expect_equal(target_only$n_target_samples_meeting_min_count, 3)
+    testthat::expect_equal(target_only$n_reference_samples_meeting_min_count, 0)
+
+    # Only retained genes are tested, and the fit matches DESeq2 run on the
+    # filtered matrix, so size factors and dispersions used filtered data.
+    dge <- read_de_tsv(file.path(contrast_dir, "results_dge.tsv"))
+    retained <- audit$GENEID[audit$filter_status == "retained"]
+    testthat::expect_setequal(dge$GENEID, retained)
+    counts <- gene_filter_two_level_counts()
+    expect_dge_matches(dge, direct_deseq2_results(round(counts)[retained, , drop = FALSE]))
+    # Not a post-hoc subset of the unfiltered fit.
+    unfiltered_dge <- read_de_tsv(file.path(unfiltered$out_dir, contrast, "results_dge.tsv"))
+    background <- sprintf("bg%02d", 1:30)
+    testthat::expect_false(isTRUE(all.equal(
+        dge$pvalue[match(background, dge$GENEID)],
+        unfiltered_dge$pvalue[match(background, unfiltered_dge$GENEID)]
+    )))
+
+    contrast_qc <- filtered$qc$contrasts[[contrast]]
+    testthat::expect_true(filtered$qc$gene_expression_filter$enabled)
+    testthat::expect_equal(filtered$qc$gene_expression_filter$min_count, 10)
+    testthat::expect_equal(filtered$qc$gene_expression_filter$min_samples, 3)
+    testthat::expect_equal(contrast_qc$gene_filter$genes_input, 43)
+    testthat::expect_equal(contrast_qc$gene_filter$genes_retained, 36)
+    testthat::expect_equal(contrast_qc$gene_filter$genes_removed, 7)
+    testthat::expect_equal(contrast_qc$genes_tested, 36)
+    testthat::expect_equal(contrast_qc$dge_total_genes, 36)
+    testthat::expect_equal(contrast_qc$dge_status, "SUCCESS")
+    testthat::expect_equal(
+        contrast_qc$dge_significant_fdr05,
+        sum(dge$padj < 0.05, na.rm = TRUE)
+    )
+    testthat::expect_equal(
+        contrast_qc$gene_filter$audit_file,
+        file.path(contrast, de_gene_filter_audit_filename)
+    )
+    testthat::expect_true(file.exists(file.path(contrast_dir, "results_dge.pdf")))
+
+    # DTU sees every transcript whether or not the gene prefilter is enabled.
+    unfiltered_qc <- unfiltered$qc$contrasts[[contrast]]
+    testthat::expect_equal(contrast_qc$transcripts_tested, unfiltered_qc$transcripts_tested)
+    testthat::expect_equal(contrast_qc$transcripts_tested, 86)
+    testthat::expect_equal(contrast_qc$dtu_status, unfiltered_qc$dtu_status)
+    testthat::expect_equal(
+        read_de_tsv(file.path(contrast_dir, "results_dexseq.tsv")),
+        read_de_tsv(file.path(unfiltered$out_dir, contrast, "results_dexseq.tsv")),
+        tolerance = 1e-8
+    )
+})
+
+testthat::test_that("samples from an excluded third condition do not affect the prefilter", {
+    run <- run_gene_filter_de(
+        levels = c("control", "treated", "treated2"),
+        de_min_count = 10L,
+        de_min_samples = 3L
+    )
+    audit_for <- function(contrast) {
+        audit <- read_de_tsv(file.path(run$out_dir, contrast, de_gene_filter_audit_filename))
+        audit[match(c("third_only", "third_tips_balance", "target_only"), audit$GENEID), ]
+    }
+
+    # control vs treated: treated2 support must not count.
+    treated <- audit_for("condition_treated_vs_control")
+    testthat::expect_equal(treated$n_samples_meeting_min_count, c(0, 2, 3))
+    testthat::expect_equal(treated$filter_status, c("excluded", "excluded", "retained"))
+
+    # control vs treated2: the same genes pass on treated2 samples.
+    treated2 <- audit_for("condition_treated2_vs_control")
+    testthat::expect_equal(treated2$n_samples_meeting_min_count, c(3, 5, 0))
+    testthat::expect_equal(treated2$filter_status, c("retained", "retained", "excluded"))
+
+    dge_treated <- read_de_tsv(file.path(run$out_dir, "condition_treated_vs_control", "results_dge.tsv"))
+    testthat::expect_false(any(c("third_only", "third_tips_balance") %in% dge_treated$GENEID))
+    testthat::expect_equal(run$qc$contrasts$condition_treated_vs_control$gene_filter$genes_retained, 36)
+    testthat::expect_equal(run$qc$contrasts$condition_treated2_vs_control$gene_filter$genes_retained, 35)
+})
+
+testthat::test_that("no genes passing the prefilter is a reported DGE failure, not zero DEGs", {
+    run <- run_gene_filter_de(de_min_count = 100000L, de_min_samples = 3L)
+    contrast <- "condition_treated_vs_control"
+    contrast_dir <- file.path(run$out_dir, contrast)
+    contrast_qc <- run$qc$contrasts[[contrast]]
+
+    testthat::expect_equal(contrast_qc$dge_status, "FAILED")
+    testthat::expect_equal(contrast_qc$dge_failure_reason, "no_genes_passed_expression_filter")
+    testthat::expect_match(contrast_qc$dge_failure_message, "No genes passed the gene expression prefilter")
+    testthat::expect_equal(contrast_qc$genes_tested, 0)
+    testthat::expect_equal(contrast_qc$gene_filter$genes_retained, 0)
+    testthat::expect_equal(contrast_qc$gene_filter$genes_removed, 43)
+    testthat::expect_equal(run$qc$analysis_fallbacks$failed_dge_contrasts, 1)
+    testthat::expect_equal(run$qc$analysis_fallbacks$dge_no_genes_passed_filter_contrasts, 1)
+    testthat::expect_equal(
+        run$qc$analysis_fallbacks$dge_no_genes_passed_filter_contrast_names,
+        contrast
+    )
+
+    failure <- readLines(file.path(contrast_dir, "DGE_ANALYSIS_FAILED.txt"))
+    testthat::expect_true(any(grepl("No genes passed the gene expression prefilter", failure, fixed = TRUE)))
+    testthat::expect_true(any(grepl(
+        "rounded count >= 100000 in >= 3 of the 6 contrast samples", failure, fixed = TRUE
+    )))
+    testthat::expect_true(any(grepl("Genes before prefilter: 43", failure, fixed = TRUE)))
+    testthat::expect_true(any(grepl("DGE RESULTS CANNOT BE INTERPRETED", failure, fixed = TRUE)))
+
+    dge <- read_de_tsv(file.path(contrast_dir, "results_dge.tsv"))
+    testthat::expect_equal(nrow(dge), 0)
+    testthat::expect_true(all(c("GENEID", "log2FoldChange", "padj") %in% names(dge)))
+    testthat::expect_true(file.exists(file.path(contrast_dir, "results_dge.pdf")))
+    audit <- read_de_tsv(file.path(contrast_dir, de_gene_filter_audit_filename))
+    testthat::expect_true(all(audit$filter_status == "excluded"))
+
+    summary <- readLines(file.path(contrast_dir, "contrast_qc_summary.txt"))
+    testthat::expect_true(any(grepl("Significant (FDR < 0.05): N/A", summary, fixed = TRUE)))
+    testthat::expect_true(any(grepl("no genes passed the gene expression prefilter", summary, fixed = TRUE)))
+    overall <- readLines(file.path(run$out_dir, "de_overall_summary.txt"))
+    testthat::expect_true(any(grepl("no genes passed the prefilter; no test performed", overall, fixed = TRUE)))
+
+    # DTU still runs on all transcripts.
+    testthat::expect_equal(contrast_qc$transcripts_tested, 86)
+    testthat::expect_true(file.exists(file.path(contrast_dir, "results_dtu_transcript.tsv")))
+})
+
+testthat::test_that("CLI propagates prefilter settings to QC JSON, summaries and audit table", {
+    fixture_dir <- tempfile("de-gene-filter-cli-")
+    dir.create(fixture_dir)
+    bundle <- write_gene_filter_fixture_bundle(fixture_dir)
+    out_dir <- file.path(fixture_dir, "out")
+    base_args <- c(
+        "de_analysis",
+        "--transcript_rds", bundle$transcript_rds,
+        "--gene_rds", bundle$gene_rds,
+        "--sample_sheet", bundle$sample_sheet,
+        "--reference_level", "control"
+    )
+
+    result <- run_rscript(
+        "supeRglue",
+        c(base_args, "--de_min_count", "10", "--de_min_samples", "3", "--out_dir", out_dir)
+    )
+    testthat::expect_equal(result$status, 0L, info = paste(result$output, collapse = "\n"))
+    testthat::expect_true(any(grepl(
+        "condition_treated_vs_control: gene expression prefilter retained 36 of 43 genes (7 removed).",
+        result$output,
+        fixed = TRUE
+    )))
+
+    de_qc <- jsonlite::read_json(file.path(out_dir, "de_qc_stats.json"), simplifyVector = TRUE)
+    testthat::expect_equal(
+        de_qc$gene_expression_filter[c("enabled", "min_count", "min_samples")],
+        list(enabled = TRUE, min_count = 10L, min_samples = 3L)
+    )
+    gene_filter <- de_qc$contrasts$condition_treated_vs_control$gene_filter
+    testthat::expect_equal(
+        gene_filter[c("genes_input", "genes_retained", "genes_removed")],
+        list(genes_input = 43L, genes_retained = 36L, genes_removed = 7L)
+    )
+    testthat::expect_true(file.exists(file.path(out_dir, gene_filter$audit_file)))
+
+    summary <- readLines(file.path(out_dir, "condition_treated_vs_control", "contrast_qc_summary.txt"))
+    testthat::expect_true(any(grepl(
+        "Rule: keep genes with rounded count >= 10 in >= 3 of the 6 contrast samples",
+        summary,
+        fixed = TRUE
+    )))
+    testthat::expect_true(any(grepl("Genes tested: 36", summary, fixed = TRUE)))
+    overall <- readLines(file.path(out_dir, "de_overall_summary.txt"))
+    testthat::expect_true(any(grepl(
+        "Gene expression prefilter (DGE only): keep genes with rounded count >= 10 in >= 3",
+        overall,
+        fixed = TRUE
+    )))
+    testthat::expect_true(any(grepl("DGE genes tested: 36 of 43 (7 removed by prefilter)", overall, fixed = TRUE)))
+
+    # Expected failures: system2() warns about the non-zero exit status.
+    partial <- suppressWarnings(run_rscript(
+        "supeRglue",
+        c(base_args, "--de_min_samples", "3", "--out_dir", file.path(fixture_dir, "partial"))
+    ))
+    testthat::expect_false(identical(partial$status, 0L))
+    testthat::expect_true(any(grepl("must either both be 0", partial$output, fixed = TRUE)))
+
+    negative <- suppressWarnings(run_rscript(
+        "supeRglue",
+        c(base_args, "--de_min_count", "-1", "--de_min_samples", "3", "--out_dir", file.path(fixture_dir, "neg"))
+    ))
+    testthat::expect_false(identical(negative$status, 0L))
+    testthat::expect_true(any(grepl("--de_min_count must be a non-negative integer", negative$output, fixed = TRUE)))
+})
